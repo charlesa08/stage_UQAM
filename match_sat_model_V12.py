@@ -8,10 +8,12 @@ météorologiques provenant de modèles (format RPN ou NetCDF) et de satellites
 1.  Charger les trajectoires de satellites (latitude, longitude, temps)
     ainsi que des variables spécifiques comme le contenu en eau de glace (IWC)
     et les hauteurs associées.
-2.  Charger plusieurs fichiers RPN du modèle (dp*) contenant à la fois la variable
-    principale (ex : 'TT' ou 'IWCR') et la variable hauteur 'GZ', chacun pour un pas de
-    temps unique (t0). Si les NetCDF 4D existent déjà (dp…_TT_4D.nc / dp…_GZ_4D.nc),
-    ils sont réutilisés.
+2.  Charger automatiquement les fichiers du modèle. Ceux-ci peuvent être :
+    - des fichiers ``dp*`` contenant à la fois la variable principale et ``GZ``;
+    - ou des paires de fichiers séparés où le nom de la variable apparaît dans le
+      chemin (ex. ``..._TT_...`` et ``..._GZ_...``).
+    Dans tous les cas, un NetCDF 4D est créé au besoin et réutilisé lors des
+    exécutions suivantes.
 3.  Filtrer les points de la trajectoire satellite qui se trouvent dans le
     domaine spatial du modèle.
 4.  Générer plusieurs types de graphiques :
@@ -79,12 +81,8 @@ if not SAT_FILES:
     sys.exit(1)
 
 MODEL_DIR = os.path.join(os.environ['HOME'], 'Codes_travail', 'MOD_sim')
-ALL_DP_FILES = sorted(glob.glob(os.path.join(MODEL_DIR, 'dp*')))
-# On ne conserve que les vrais RPN (sans extension .nc)
-MODEL_RPN_BASE = [f for f in ALL_DP_FILES if not f.endswith('.nc')]
-if not MODEL_RPN_BASE:
-    print(f"Erreur: Aucun fichier RPN (dp* sans .nc) dans {MODEL_DIR}")
-    sys.exit(1)
+
+# Les fichiers du modèle seront détectés plus bas via _gather_model_file_pairs
 
 VAR_MODEL_PRIMARY   = 'TT'
 VAR_MODEL_GZ_NAME   = 'GZ'
@@ -109,6 +107,44 @@ mpl.rcParams['agg.path.chunksize'] = 10000
 # -----------------------------------------------------------------------------
 def _unwrap_structured_array(arr):
     return arr[arr.dtype.names[0]] if hasattr(arr.dtype, 'names') and arr.dtype.names else arr
+
+def _gather_model_file_pairs(model_dir: str, main_var: str, gz_var: str) -> List[Tuple[str, str]]:
+    """Détermine la liste des fichiers modèle à utiliser.
+
+    Deux stratégies sont tentées :
+    1.  Si des fichiers de type ``dp*`` (RPN) sont présents, on suppose que
+        chaque fichier contient la variable principale **et** ``gz_var``.
+    2.  Sinon, on cherche des paires de fichiers séparés contenant explicitement
+        le nom des variables dans leur chemin (``*_<var>_*``).
+
+    La fonction retourne une liste de tuples ``[(path_main, path_gz), ...]`` où
+    ``path_main`` et ``path_gz`` peuvent être des fichiers RPN ou NetCDF déjà
+    convertis.
+    """
+
+    # -- Cas 1 : fichiers dp* contenant toutes les variables
+    base_rpn = sorted(f for f in glob.glob(os.path.join(model_dir, 'dp*')) if not f.endswith('.nc'))
+    if base_rpn:
+        return [(p, p) for p in base_rpn]
+
+    # -- Cas 2 : variables séparées
+    import re
+    main_candidates = sorted(glob.glob(os.path.join(model_dir, f'*{main_var}*')))
+    gz_candidates = sorted(glob.glob(os.path.join(model_dir, f'*{gz_var}*')))
+    token_re = re.compile(r'(\d{8}\.\d{6}s)')
+    pairs = []
+    for m in main_candidates:
+        token = token_re.search(os.path.basename(m))
+        if not token:
+            continue
+        t = token.group(1)
+        g_match = next((g for g in gz_candidates if t in g), None)
+        if g_match:
+            pairs.append((m, g_match))
+    if pairs:
+        return pairs
+
+    raise FileNotFoundError(f"Aucun fichier modèle trouvé dans {model_dir}")
 
 def _convert_rpn_to_netcdf_4d(rpn_path: str, varname: str) -> str:
     ncfile = rpn_path + f'_{varname}_4D.nc'
@@ -155,17 +191,27 @@ def _convert_rpn_to_netcdf_4d(rpn_path: str, varname: str) -> str:
     ds.to_netcdf(ncfile)
     return ncfile
 
-def _load_model_variable_4d(rpn_base: str, varname: str) -> Tuple[xr.Dataset, np.ndarray, np.ndarray]:
+def _load_model_variable_4d(path: str, varname: str) -> Tuple[xr.Dataset, np.ndarray, np.ndarray]:
+    """Ouvre une variable du modèle sous forme 4D (time, level, y, x).
+
+    Le paramètre *path* peut être :
+        - un fichier NetCDF déjà converti (xxx_4D.nc) contenant uniquement la variable,
+        - un fichier RPN qui sera converti en NetCDF 4D si besoin,
+        - la base "dp*" commune aux deux variables lorsque celles-ci sont dans le
+          même fichier RPN.
     """
-    Si un NetCDF 4D existe déjà pour varname, on l'ouvre ;
-    sinon on convertit le RPN rpn_base → NetCDF 4D.
-    """
-    nc_existing = rpn_base + f'_{varname}_4D.nc'
+
+    if path.endswith('.nc'):
+        ds = xr.open_dataset(path)
+        return ds, ds['lat'].values, ds['lon'].values
+
+    nc_existing = path + f'_{varname}_4D.nc'
     if os.path.isfile(nc_existing):
         ds = xr.open_dataset(nc_existing)
     else:
-        ncfile = _convert_rpn_to_netcdf_4d(rpn_base, varname)
+        ncfile = _convert_rpn_to_netcdf_4d(path, varname)
         ds = xr.open_dataset(ncfile)
+
     return ds, ds['lat'].values, ds['lon'].values
 
 def _read_satellite_h5(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -236,15 +282,22 @@ def _read_satellite_h5(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, O
             fac = 1.0
             if SAT_FIELD_IWC_FACTOR in h5f.attrs:
                 fac = h5f.attrs[SAT_FIELD_IWC_FACTOR]
-                if isinstance(fac, np.ndarray): fac = fac.flatten()[0]
+                if isinstance(fac, np.ndarray):
+                    fac = fac.flatten()[0]
             if fac != 0:
                 iwc = iwc / fac
             iwc_missing = None
             if SAT_FIELD_IWC_MISSING in h5f.attrs:
                 iwc_missing = h5f.attrs[SAT_FIELD_IWC_MISSING]
-                if isinstance(iwc_missing, np.ndarray): iwc_missing = iwc_missing.flatten()[0]
+                if isinstance(iwc_missing, np.ndarray):
+                    iwc_missing = iwc_missing.flatten()[0]
             if iwc_missing is not None:
                 iwc = np.ma.masked_where(iwc == iwc_missing, iwc)
+            # Orientation : points x niveaux
+            n_pts = len(lat)
+            if iwc.ndim >= 2:
+                if iwc.shape[0] != n_pts and iwc.shape[1] == n_pts:
+                    iwc = iwc.T
             iwc_data = iwc
             print(f"    IWC satellite extrait. Forme: {iwc.shape}")
 
@@ -252,6 +305,10 @@ def _read_satellite_h5(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, O
         if SAT_FIELD_HEIGHT in h5f:
             raw_h = h5f[SAT_FIELD_HEIGHT][...]
             h = _unwrap_structured_array(raw_h).astype(np.float32)
+            n_pts = len(lat)
+            if h.ndim >= 2:
+                if h.shape[0] != n_pts and h.shape[1] == n_pts:
+                    h = h.T
             height_data = h
             print(f"    Hauteur satellite extraite. Forme: {h.shape}")
 
@@ -270,8 +327,22 @@ def _filter_in_domain(lat_sat, lon_sat, time_sat, lat2d, lon2d, iwc=None, height
     mask = d <= thr
     print(f"  4.1) {mask.sum()} points in-domain")
     yi, xi = np.unravel_index(idx[mask], lat2d.shape)
-    iwc_in = iwc[mask] if (iwc is not None and len(iwc)==len(mask)) else None
-    hgt_in = height[mask] if (height is not None and len(height)==len(mask)) else None
+
+    iwc_in = None
+    if iwc is not None:
+        arr = iwc
+        if arr.shape[0] != len(mask) and arr.ndim > 1 and arr.shape[1] == len(mask):
+            arr = arr.T
+        if arr.shape[0] == len(mask):
+            iwc_in = arr[mask]
+
+    hgt_in = None
+    if height is not None:
+        arr = height
+        if arr.shape[0] != len(mask) and arr.ndim > 1 and arr.shape[1] == len(mask):
+            arr = arr.T
+        if arr.shape[0] == len(mask):
+            hgt_in = arr[mask]
     return lat_sat[mask], lon_sat[mask], time_sat[mask], (yi,xi), mask, iwc_in, hgt_in
 
 def _plot_main_map(
@@ -522,8 +593,15 @@ def _plot_satellite_curtain(
     """
     print(f"  → Tracé rideau satellite (granule {granule_idx})...")
     n_pts, n_levels = iwc_sat_in.shape
+    if n_pts != len(lat_sat_in) and n_levels == len(lat_sat_in):
+        iwc_sat_in = iwc_sat_in.T
+        n_pts, n_levels = iwc_sat_in.shape
+
+    if height_sat_in.shape[0] != n_pts and height_sat_in.shape[1] == n_pts:
+        height_sat_in = height_sat_in.T
+
     data = iwc_sat_in.T
-    alt = height_sat_in[0,:] / 1000.0
+    alt = height_sat_in[0, :] / 1000.0
     order = np.argsort(alt)
     alt = alt[order]; data = data[order,:]
     x = np.arange(n_pts)
@@ -577,24 +655,28 @@ def main():
 
     # --- Étape 1 : chargement manuel de chaque pas de temps du modèle ---
     print("\nÉtape 1: Chargement manuel des pas de temps RPN → NetCDF 4D…")
-    model_ds_list   = []
-    model_times     = []
-    model_lat2d     = None
-    model_lon2d     = None
+    model_ds_list = []
+    model_times   = []
+    model_lat2d   = None
+    model_lon2d   = None
 
-    for base in MODEL_RPN_BASE:
-        print(f"  → Base RPN : {os.path.basename(base)}")
-        ds_tt, lat2d, lon2d = _load_model_variable_4d(base, VAR_MODEL_PRIMARY)
-        ds_gz, _, _         = _load_model_variable_4d(base, VAR_MODEL_GZ_NAME)
-        # fusion des coords et des variables
-        ds_gz = ds_gz.assign_coords(lat=ds_tt['lat'], lon=ds_tt['lon'])
-        ds    = xr.merge([ds_tt, ds_gz])
-        t0    = ds['time'].values[0]
+    pairs = _gather_model_file_pairs(MODEL_DIR, VAR_MODEL_PRIMARY, VAR_MODEL_GZ_NAME)
+
+    for main_path, gz_path in pairs:
+        print(f"  → Fichiers : {os.path.basename(main_path)} / {os.path.basename(gz_path)}")
+        ds_main, lat2d, lon2d = _load_model_variable_4d(main_path, VAR_MODEL_PRIMARY)
+        ds_gz, _, _ = _load_model_variable_4d(gz_path, VAR_MODEL_GZ_NAME)
+
+        ds_gz = ds_gz.assign_coords(lat=ds_main['lat'], lon=ds_main['lon'])
+        ds = xr.merge([ds_main, ds_gz])
+
+        t0 = ds['time'].values[0]
         model_ds_list.append(ds)
         model_times.append(t0)
-        # garder la grille 2D (identique pour tous les pas)
-        model_lat2d = lat2d
-        model_lon2d = lon2d
+
+        if model_lat2d is None:
+            model_lat2d = lat2d
+            model_lon2d = lon2d
 
     model_times = np.array(model_times, dtype='datetime64[ns]')
     print(f"  → {len(model_ds_list)} pas de temps chargés, t0 = {model_times}")
