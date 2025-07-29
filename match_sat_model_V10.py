@@ -41,7 +41,7 @@ Pour les environnements de calcul (HPC), vous pourriez avoir besoin de charger d
 avant d'exécuter ce script, par exemple :
 $ module load python3/miniconda3 python3/python-rpn python3/outils-divers
 Puis activez votre environnement Conda :
-$ conda activate monenv
+$ conda activate base_plus
 """
 
 import os
@@ -57,13 +57,13 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
+from matplotlib import cm
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from collections import defaultdict
 from datetime import datetime, timedelta 
 import pandas as pd 
 import pyproj
-import pdb
 import pdb
 
 # --- Correction pour la compatibilité Python < 3.9 pour les annotations de type (à retirer au besoin) ---
@@ -98,7 +98,7 @@ if not SAT_FILES:
 
 # configuration pour un fichier modèle RPN unique contenant les deux variables
 # Décommentez et définissez ce chemin si vous avez un fichier RPN unique
-#SINGLE_MODEL_RPN_FILE = os.path.join(os.environ['HOME'], 'Codes_travail', 'MOD_sim', 'dm2007010100_20070101.001000s')
+# SINGLE_MODEL_RPN_FILE = os.path.join(os.environ['HOME'], 'Codes_travail', 'MOD_sim', 'dm2007010100_20070101.001000s')
 SINGLE_MODEL_RPN_FILE = None # Laissez à None si vous utilisez toujours deux fichiers séparés
 
 MODEL_RPN_MAIN_VAR = os.path.join(os.environ['HOME'], 'Codes_travail', 'MOD_sim',
@@ -117,6 +117,8 @@ SAT_FIELD_IWC_MISSING = '2C-ICE/Swath Attributes/IWC.missing'
 OUTPUT_IMAGE_BASE_NAME = 'match_sat_model_results.png'
 RES_FIG_DIR = '/home/chevalier/Codes_travail/RES_FIG'
 
+MAIN_MAP_ENABLED = True
+ZOOM_ACT_MAIN_MAP = True
 VERTICAL_PROFILE_ENABLED = True
 
 VERTICAL_PLOT_ALTITUDE_MAX_KM = 15
@@ -420,103 +422,158 @@ def _filter_in_domain(
         )
 
 def _plot_main_map(
-    all_sat_lats: List[np.ndarray], all_sat_lons: List[np.ndarray],
-    all_in_domain_data: List[Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]],
-    all_matched_points: List[np.ndarray],
-    model_lat2d: np.ndarray, model_lon2d: np.ndarray,
-    output_base_name: str
-):
+    traj_lat_segments, traj_lon_segments,
+    in_domain_coords, matched_indices,
+    grid_lat2d, grid_lon2d,
+    output_basename
+) -> None:
     """
-    Génère les cartes principales (vue globale et zoom sur le domaine).
+    Trace la vue globale (projection polaire) du domaine modèle
+    et, si ZOOM_ACT_MAIN_MAP == True, ajoute un cadre de zoom + un 
+    zoom détaillé en second panneau (aussi en projection polaire),
+    en affichant tous les points de la grille modèle et le rectangle vert.
     """
-    print("  5.1) Génération des cartes principales (vue globale et zoom)...")
-    
-    all_lat_in = np.concatenate([data[0] for data in all_in_domain_data])
-    all_lon_in = np.concatenate([data[1] for data in all_in_domain_data])
+    from matplotlib.patches import Polygon as MplPolygon
 
-    if all_lat_in.size == 0:
-        print("  5.1) Aucun point satellite in-domain à tracer. Les cartes principales sont ignorées.")
-        return
+    # 1) Concaténation des trajectoires
+    all_traj_lats = np.concatenate(traj_lat_segments)
+    all_traj_lons = np.concatenate(traj_lon_segments)
+    in_lats = np.concatenate([coords[0] for coords in in_domain_coords])
+    in_lons = np.concatenate([coords[1] for coords in in_domain_coords])
 
-    lon_min_in, lon_max_in = all_lon_in.min(), all_lon_in.max()
-    lat_min_in, lat_max_in = all_lat_in.min(), all_lat_in.max()
-    
-    pad_factor = 0.15
-    pad_lat = (lat_max_in - lat_min_in) * pad_factor
-    pad_lon = (lon_max_in - lon_min_in) * pad_factor
+    # 2) Étendue de la grille complète
+    full_lon_min, full_lon_max = grid_lon2d.min(), grid_lon2d.max()
+    full_lat_min, full_lat_max = grid_lat2d.min(), grid_lat2d.max()
 
-    fig = plt.figure(figsize=(16, 6))
-    gs = gridspec.GridSpec(1, 2, wspace=0.3)
+    # 3) Détection du zoom
+    zoom_active = globals().get('ZOOM_ACT_MAIN_MAP', False)
+    ncols = 2 if zoom_active else 1
+    fig = plt.figure(figsize=(14, 6) if zoom_active else (7, 6))
+    gs = gridspec.GridSpec(1, ncols, wspace=0.3)
 
-    ax0 = fig.add_subplot(gs[0], projection=ccrs.PlateCarree())
-    ax0.set_global()
-    ax0.coastlines(resolution='50m')
-    ax0.add_feature(cfeature.LAND, facecolor='lightgray', zorder=0)
-    ax0.gridlines(draw_labels=True, linewidth=0.2, color='gray', alpha=0.5, linestyle='-')
+    # ----- Panneau 1 : Vue globale polaire -----
+    ax0 = fig.add_subplot(gs[0], projection=ccrs.NorthPolarStereo())
+    ax0.set_extent(
+        [full_lon_min, full_lon_max, full_lat_min, full_lat_max],
+        ccrs.PlateCarree()
+    )
+    ax0.coastlines('50m')
+    ax0.add_feature(cfeature.LAND)
+    ax0.gridlines(color='gray', linestyle=':')
 
-    ax0.scatter(model_lon2d.ravel(), model_lat2d.ravel(), s=1, color='gray', alpha=0.3, transform=ccrs.PlateCarree(), label='Grille modèle')
-    
-    for lat, lon in zip(all_sat_lats, all_sat_lons):
-        step = max(1, len(lat) // 2000)
-        ax0.plot(lon[::step], lat[::step], '--k', transform=ccrs.Geodetic(), linewidth=0.8, label='Trajectoire satellite' if lat is all_sat_lats[0] else None)
-    
-    from matplotlib.patches import Rectangle
-    rect_model = Rectangle((model_lon2d.min(), model_lat2d.min()), model_lon2d.ptp(), model_lat2d.ptp(),
-                           edgecolor='red', facecolor='none', lw=2, label='Limites Modèle')
-    rect_in_domain = Rectangle((lon_min_in, lat_min_in), lon_max_in - lon_min_in, lat_max_in - lat_min_in,
-                               edgecolor='green', facecolor='none', ls='--', lw=1, label='Zone In-domain')
-    ax0.add_patch(rect_model)
-    ax0.add_patch(rect_in_domain)
-    
-    ax0.set_title('Vue globale des trajectoires et du domaine du modèle', fontsize=12)
-    ax0.legend(loc='lower left', fontsize=8)
+    # a) toute la grille modèle
+    ax0.scatter(grid_lon2d.ravel(), grid_lat2d.ravel(),s=5, color='lightgray', alpha=0.7,transform=ccrs.PlateCarree(),label='Grille modèle')
 
-    ax1 = fig.add_subplot(gs[1], projection=ccrs.PlateCarree())
-    ax1.set_extent([lon_min_in - pad_lon, lon_max_in + pad_lon,
-                    lat_min_in - pad_lat, lat_max_in - pad_lat],
-                    crs=ccrs.PlateCarree())
-    ax1.coastlines(resolution='50m')
-    ax1.gridlines(draw_labels=True, linewidth=0.3, color='gray', alpha=0.5, linestyle='-')
+    # b) trajectoires
+    palette = cm.get_cmap('tab10', len(traj_lat_segments))
+     # tout le segment des trajectoires
+    for i, (lats, lons) in enumerate(zip(traj_lat_segments, traj_lon_segments)):
+        ax0.plot(lons, lats,linewidth=1.5,linestyle='dashed',color=palette(i),transform=ccrs.Geodetic(),label=f'Granule {i+1}')
+     # segment in-domain des trajectoires seulement 
+    for i, (in_lats, in_lons, *_ ) in enumerate(in_domain_coords):
+        ax0.plot(in_lons, in_lats,linestyle='-',color=palette(i),transform=ccrs.Geodetic(),label=f'In-domain {i+1}')
 
-    step_grid = max(1, int(np.sqrt(model_lat2d.size / 200000)))
-    ax1.scatter(model_lon2d[::step_grid, ::step_grid], model_lat2d[::step_grid, ::step_grid],
-                s=5, color='gray', alpha=0.4, transform=ccrs.PlateCarree(), label='Grille modèle')
-    
-    ax1.scatter(all_lon_in, all_lat_in, s=20, color='blue', alpha=0.9, transform=ccrs.PlateCarree(), label='Points In-domain')
-    
-    for mp in all_matched_points:
-    # mp est soit déjà un array (forme (n,2)), soit un tuple (yi, xi)
-        if isinstance(mp, tuple) and len(mp) == 2:
-            yi, xi = mp
-            # construire un array de shape (n, 2)
-            pts = np.vstack((yi, xi)).T
-        else:
-            pts = np.asarray(mp)
+    # c) cadre vert si zoom (sur la première granule only)
+    if zoom_active:
+        # on ne prend que la 1ʳᵉ granule pour le zoom
+        in_lats0, in_lons0, *_, = in_domain_coords[0]
+        yi0, xi0 = matched_indices[0]
 
-        ax1.scatter(
-            model_lon2d.ravel()[pts[:,1] + pts[:,0]*model_lon2d.shape[1]],
-            model_lat2d.ravel()[pts[:,1] + pts[:,0]*model_lat2d.shape[1]],
-            s=50, marker='*', color='red', edgecolor='black', lw=0.7,
+        center0 = len(in_lats0) // 2
+        cy, cx = yi0[center0], xi0[center0]
+
+        half = 50
+        y0, y1 = max(0, cy - half), min(grid_lat2d.shape[0], cy + half)
+        x0, x1 = max(0, cx - half), min(grid_lon2d.shape[1], cx + half)
+
+        zoom_lats = grid_lat2d[y0:y1, x0:x1]
+        zoom_lons = grid_lon2d[y0:y1, x0:x1]
+        lon_min, lon_max = zoom_lons.min(), zoom_lons.max()
+        lat_min, lat_max = zoom_lats.min(), zoom_lats.max()
+
+        bbox = [
+            (lon_min, lat_min),
+            (lon_min, lat_max),
+            (lon_max, lat_max),
+            (lon_max, lat_min),
+        ]
+        rect0 = MplPolygon(
+            bbox, closed=True,
+            edgecolor='green', facecolor='none', linewidth=2,
             transform=ccrs.PlateCarree(),
-            label='Correspondances' if mp is all_matched_points[0] else None
+            label='Zone zoom (Granule 1)'
+        )
+        ax0.add_patch(rect0)
+        
+    ax0.set_title('Vue globale polaire')
+    ax0.legend(loc='lower center',bbox_to_anchor=(0.5, -0.1), ncol=3)
+    
+    # ----- Panneau 2 : Zoom in-domain (polaire) -----
+    if zoom_active:
+        ax1 = fig.add_subplot(gs[1], projection=ccrs.NorthPolarStereo())
+        ax1.set_extent([lon_min, lon_max, lat_min, lat_max], ccrs.PlateCarree())
+        ax1.coastlines('50m')
+        ax1.add_feature(cfeature.LAND)
+        ax1.gridlines(color='gray', linestyle=':')
+
+        # 1) tous les points de la grille (seront masqués hors étendue)
+        ax1.scatter(
+            grid_lon2d.ravel(), grid_lat2d.ravel(),
+            s=5, color='lightgray', alpha=0.7,
+            transform=ccrs.PlateCarree(),
+            label='Grille modèle'
+        )
+
+        # 2) trajectoire in-domain de la 1ʳᵉ granule
+        ax1.plot(in_lons0, in_lats0,linestyle='-',color=palette(0), transform=ccrs.Geodetic(),label='In-domain Granule 1'
+        )
+
+        # 3) points appariés (étoiles rouges) de la 1ʳᵉ granule
+        flat0 = yi0 * grid_lon2d.shape[1] + xi0
+        m_lons0 = grid_lon2d.ravel()[flat0]
+        m_lats0 = grid_lat2d.ravel()[flat0]
+        ax1.scatter(
+            m_lons0, m_lats0,
+            s=30, marker='*', color='red',
+            transform=ccrs.PlateCarree(),
+            label='Points appariés Granule 1'
+        )
+
+        # 4) même rectangle vert dans le zoom
+        rect1 = MplPolygon(
+            bbox, closed=True,
+            edgecolor='green', facecolor='none', linewidth=2,
+            transform=ccrs.PlateCarree(),
+            label='Zone zoom (Granule 1)'
+        )
+        ax1.add_patch(rect1)
+
+        ax1.set_title('Zoom in-domain (Granule 1)')
+        ax1.legend(
+            loc='lower center',
+            bbox_to_anchor=(0.5, -0.1),
+            ncol=3,
+            fontsize='small'
         )
     
-    ax1.set_title('Zoom sur la zone in-domain du modèle', fontsize=12)
-    ax1.legend(loc='upper left', fontsize=8)
+    # ----- Finalisation & sauvegarde -----
+    plt.suptitle('Colocalisation des trajectoires satelittes avec le domaine du modèle')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-    plt.suptitle('Appariement Trajectoire Satellite ↔ Grille Modèle', fontsize=16, y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    
-    output_filepath = output_base_name.replace('.png', '_main_map.png')
-    full_path_out = os.path.join(RES_FIG_DIR, output_filepath)
-    plt.savefig(full_path_out, dpi=300)
-    print(f"  5.1) Cartes principales sauvegardées : {os.path.basename(output_filepath)}")
+    out_path = os.path.join(
+        RES_FIG_DIR,
+        output_basename.replace('.png', '_polar_zoom.png')
+    )
+    plt.savefig(out_path, dpi=300)
     plt.close(fig)
+
+    print(f"    → {os.path.basename(out_path)}")
+
 
 # -----------------------------------------------------------------------------
 # Fonction de tracé d'une coupe verticale du modèle le long d'une trajectoire
 # -----------------------------------------------------------------------------
-def _plot_vertical_curtain(
+def _plot_model_vertical_curtain(
     model_ds,                # xarray.Dataset contenant les variables du modèle
     lat_sat,                 # 1-D array des latitudes in-domain
     lon_sat,                 # 1-D array des longitudes in-domain
@@ -525,13 +582,13 @@ def _plot_vertical_curtain(
     granule_idx: int,        # indice du granule pour le titre / nom de fichier
     var_name: str,           # ex. 'IWCR'
     altitude_var_name: str,  # ex. 'GZ'
-    model_display_name: str, # ex. 'gem48'
+    model_display_name: str, # ex. 'GEM model'
     altitude_max_km: float,  # ex. 8.0
     output_base_name: str,   # ex. 'match_sat_model_results.png'
     time_match_threshold_hours: float = 6.0
 ):
 
-    print(f"  → Tracé coupe verticale (granule {granule_idx})...")
+    print(f"  → Tracé rideau modèle (granule {granule_idx})...")
 
     # 1) Dépack et dimensions
     yi, xi = matched_model_points
@@ -610,12 +667,111 @@ def _plot_vertical_curtain(
     )
 
     plt.tight_layout()
-    out = output_base_name.replace('.png', f'_vertc_{granule_idx}.png')
+    out = output_base_name.replace('.png', f'_modc_{granule_idx}.png')
     full_path_out = os.path.join(RES_FIG_DIR, out)
     fig.savefig(full_path_out, dpi=300)
     plt.close(fig)
     print(f"  → Sauvegardé : {os.path.basename(out)}")
 
+def _plot_satellite_curtain(
+    lat_sat_in: np.ndarray,
+    lon_sat_in: np.ndarray,
+    time_sat_in: np.ndarray,
+    iwc_sat_in: np.ndarray,
+    height_sat_in: np.ndarray,
+    granule_idx: int,
+    output_base_name: str
+) -> None:
+    """
+    Trace le rideau vertical de l'IWC satellite le long de sa trajectoire in-domain.
+    Comparable à _plot_vertical_curtain pour le modèle, mais à partir des données CALIPSO.
+    """
+    print(f"  → Tracé rideau satellite (granule {granule_idx})...")
+
+    # Nombre de points et de couches verticales
+    n_pts, n_levels = iwc_sat_in.shape
+
+    # 1) Construire la matrice (levels × points)
+    #    iwc_sat_in : shape (points, levels) → data : (levels, points)
+    data = iwc_sat_in.T
+
+    # 2) Altitudes (en km) par niveau
+    #    height_sat_in : shape (points, levels) — on suppose que chaque profil a les mêmes hauteurs
+    alt = height_sat_in[0, :] / 1_000.0  # conversion m → km
+
+    # 3) Trier par altitude croissante
+    order = np.argsort(alt)
+    alt = alt[order]
+    data = data[order, :]
+
+    # 4) Bords de cellules pour pcolormesh
+    # X : points indexés de 0 à n_pts-1
+    x = np.arange(n_pts)
+    x_edges = np.concatenate(([x[0] - 0.5], x + 0.5))
+
+    # Z : niveaux d'altitude
+    dz = np.diff(alt)
+    z_edges = np.empty(len(alt) + 1)
+    z_edges[1:-1] = alt[:-1] + dz / 2
+    z_edges[0]      = alt[0] - dz[0] / 2
+    z_edges[-1]     = alt[-1] + dz[-1] / 2
+
+    # 5) Colormap sur IWC (log scale), garantir vmin>0 et vmax>vmin
+    # on ne retient que les valeurs strictement > 0 pour la stats
+    positive = data[np.isfinite(data) & (data > 0)]
+    if positive.size:
+        p5, p95 = np.nanpercentile(positive, [5, 95])
+        vmin = max(p5, 1e-6)
+        vmax = max(p95, vmin * 10)
+        norm = mpl.colors.LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        # cas où tout est nul ou invalide : on passe en échelle linéaire
+        norm = None
+
+    # 6) Tracé
+    fig, ax = plt.subplots(figsize=(10, 4))
+    pcm = ax.pcolormesh(
+        x_edges, z_edges, data,
+        shading='flat', cmap='viridis',
+        norm=norm
+    )
+    if norm:
+        cb = fig.colorbar(pcm, ax=ax, extend='both')
+        cb.set_label('IWC satellite (g·m⁻³)')
+    else:
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label('IWC satellite (g·m⁻³) – échelle linéaire')
+
+    # 7) Axes
+    # ax.set_ylim(0, np.max(alt) * 1.05)
+    ax.set_ylim(0, VERTICAL_PLOT_ALTITUDE_MAX_KM)
+    ax.set_ylabel('Altitude (km)')
+
+    # X-ticks avec lat/lon
+    nt = min(6, n_pts)
+    ticks = np.linspace(0, n_pts - 1, nt, dtype=int)
+    labels = [
+        f"Lon: {lon_sat_in[i]:.2f}°\nLat: {lat_sat_in[i]:.2f}°"
+        for i in ticks
+    ]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_xlabel("Point le long de la trajectoire satellite")
+
+    # Titre
+    time_ref = np.datetime_as_string(time_sat_in[ticks[0]], unit='s')
+    ax.set_title(
+        f"CALIPSO – Rideau vertical d'IWC à {time_ref} UTC\n"
+        f"(Granule {granule_idx})"
+    )
+
+    plt.tight_layout()
+    out_name = output_base_name.replace('.png', f'_satc_{granule_idx}.png')
+    out_path = os.path.join(RES_FIG_DIR, out_name)
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+    print(f"  → Sauvegardé : {os.path.basename(out_name)}")
 
 # -----------------------------------------------------------------------------
 # PROGRAMME PRINCIPAL
@@ -627,7 +783,7 @@ def main():
     """
     start_time_script = time.time()
     print("==== DÉMARRAGE DU SCRIPT ====")
-    
+
     # Étape 0: nettoyage du dossier de sortie
     if os.path.exists(RES_FIG_DIR):
         for f in glob.glob(os.path.join(RES_FIG_DIR, '*.png')):
@@ -635,48 +791,55 @@ def main():
     else:
         os.makedirs(RES_FIG_DIR)
     print(f"Étape 0 : répertoire de sortie vidé -> {RES_FIG_DIR}")
-    
+
     if SINGLE_MODEL_RPN_FILE and os.path.exists(SINGLE_MODEL_RPN_FILE):
         print("\nÉtape 1: Chargement des variables du modèle à partir d'un fichier RPN unique...")
-        # Appelle _load_model_variable_4d deux fois avec le même fichier RPN,
-        # mais des noms de variables différents. La fonction _convert_rpn_to_netcdf_4d
-        # gérera la conversion et la mise en cache des NetCDF distincts pour chaque variable.
-        ds_main_var, model_lat2d_grid, model_lon2d_grid = _load_model_variable_4d(SINGLE_MODEL_RPN_FILE, VAR_MODEL_PRIMARY)
-        ds_gz_var, _, _ = _load_model_variable_4d(SINGLE_MODEL_RPN_FILE, VAR_MODEL_GZ_NAME)
+        ds_main_var, model_lat2d_grid, model_lon2d_grid = _load_model_variable_4d(
+            SINGLE_MODEL_RPN_FILE, VAR_MODEL_PRIMARY
+        )
+        ds_gz_var, _, _ = _load_model_variable_4d(
+            SINGLE_MODEL_RPN_FILE, VAR_MODEL_GZ_NAME
+        )
     else:
-        # Logique existante pour des fichiers RPN séparés
         print("\nÉtape 1: Chargement de la variable principale du modèle à partir de son fichier RPN...")
-        ds_main_var, model_lat2d_grid, model_lon2d_grid = _load_model_variable_4d(MODEL_RPN_MAIN_VAR, VAR_MODEL_PRIMARY)
+        ds_main_var, model_lat2d_grid, model_lon2d_grid = _load_model_variable_4d(
+            MODEL_RPN_MAIN_VAR, VAR_MODEL_PRIMARY
+        )
         print("\nÉtape 2: Chargement de la variable de hauteur géopotentielle (GZ) à partir de son fichier RPN...")
-        ds_gz_var, _, _ = _load_model_variable_4d(MODEL_RPN_GZ_VAR, VAR_MODEL_GZ_NAME)
-    
-    
+        ds_gz_var, _, _ = _load_model_variable_4d(
+            MODEL_RPN_GZ_VAR, VAR_MODEL_GZ_NAME
+        )
+
     print("\nÉtape 3: Fusion des Datasets du modèle...")
     try:
+        common_lat = ds_main_var['lat']
+        common_lon = ds_main_var['lon']
+        ds_gz_var = ds_gz_var.assign_coords(lat=common_lat, lon=common_lon)
         model_ds_merged = xr.merge([ds_main_var, ds_gz_var])
         print("  3.0) Datasets du modèle (variable principale et GZ) fusionnés avec succès.")
-        
     except Exception as e:
-        print(f"Erreur lors de la fusion des Datasets du modèle. Assurez-vous qu'ils ont des coordonnées et dimensions compatibles. Erreur: {e}")
+        print(f"Erreur lors de la fusion des Datasets du modèle. Erreur: {e}")
         sys.exit(1)
- 
-    all_satellite_lats_full = [] # stocke, pour chaque granule, le tableau complet des latitudes parcourues
-    all_satellite_lons_full = [] # stocke, pour chaque granule, le tableau complet des longitudes parcourues
-    all_in_domain_data_list = [] # pour chaque granule, contient un tuple (latitudes_in, longitudes_in, temps_in, IWC_in, hauteur_in) relatives aux points « in-domain »
-    all_matched_model_points_list = [] # pour chaque granule, indices (yi, xi) des points de grille modèle appariés aux points in-domain
-    all_in_domain_masks = [] # pour chaque granule, masque booléen (True si point dans le domaine modèle)
+
+    all_satellite_lats_full = []
+    all_satellite_lons_full = []
+    all_in_domain_data_list = []
+    all_matched_model_points_list = []
+    all_in_domain_masks = []
 
     print("\nÉtape 4: Traitement des fichiers satellite, appariement et génération des profils verticaux pour le modèle (si activé)...")
     for idx, sat_filepath in enumerate(SAT_FILES, 1):
         print(f"\n--- Traitement du Granule {idx}/{len(SAT_FILES)} : {os.path.basename(sat_filepath)} ---")
         try:
-            lat_satellite_full, lon_satellite_full, time_satellite_full, iwc_satellite_full, height_satellite_full = _read_satellite_h5(sat_filepath) 
-            
+            lat_satellite_full, lon_satellite_full, time_satellite_full, iwc_satellite_full, height_satellite_full = _read_satellite_h5(sat_filepath)
+
             lat_in_domain, lon_in_domain, time_in_domain, matched_model_points, mask_in_domain, iwc_in_domain, height_in_domain = \
-                _filter_in_domain(lat_satellite_full, lon_satellite_full, time_satellite_full, 
-                                  model_lat2d_grid, model_lon2d_grid,
-                                  iwc_sat=iwc_satellite_full, height_sat=height_satellite_full)
-            
+                _filter_in_domain(
+                    lat_satellite_full, lon_satellite_full, time_satellite_full,
+                    model_lat2d_grid, model_lon2d_grid,
+                    iwc_sat=iwc_satellite_full, height_sat=height_satellite_full
+                )
+
             all_satellite_lats_full.append(lat_satellite_full)
             all_satellite_lons_full.append(lon_satellite_full)
             all_in_domain_masks.append(mask_in_domain)
@@ -685,24 +848,32 @@ def main():
                 all_in_domain_data_list.append((lat_in_domain, lon_in_domain, time_in_domain, iwc_in_domain, height_in_domain))
                 all_matched_model_points_list.append(matched_model_points)
 
-                if VERTICAL_PROFILE_ENABLED:
-                    if time_in_domain.size > 0:
-                        _plot_vertical_curtain(
-                            model_ds_merged,
-                            lat_in_domain,
-                            lon_in_domain,
-                            time_in_domain,
-                            matched_model_points,
-                            granule_idx=idx,
-                            var_name=VAR_MODEL_PRIMARY,
-                            altitude_var_name=VAR_MODEL_GZ_NAME,
-                            model_display_name=VERTICAL_PLOT_MODEL_NAME,
-                            altitude_max_km=VERTICAL_PLOT_ALTITUDE_MAX_KM,
-                            output_base_name=OUTPUT_IMAGE_BASE_NAME,
-                            time_match_threshold_hours=TIME_MATCH_THRESHOLD_HOURS
-                        )
-                    else:
-                        print(f"    Avertissement: Pas de temps de survol valide pour le granule {idx}, la coupe verticale est ignorée.")
+                if VERTICAL_PROFILE_ENABLED and time_in_domain.size > 0:
+                    _plot_model_vertical_curtain(
+                        model_ds_merged,
+                        lat_in_domain,
+                        lon_in_domain,
+                        time_in_domain,
+                        matched_model_points,
+                        granule_idx=idx,
+                        var_name=VAR_MODEL_PRIMARY,
+                        altitude_var_name=VAR_MODEL_GZ_NAME,
+                        model_display_name=VERTICAL_PLOT_MODEL_NAME,
+                        altitude_max_km=VERTICAL_PLOT_ALTITUDE_MAX_KM,
+                        output_base_name=OUTPUT_IMAGE_BASE_NAME,
+                        time_match_threshold_hours=TIME_MATCH_THRESHOLD_HOURS
+                    )
+                    _plot_satellite_curtain(
+                        lat_in_domain,
+                        lon_in_domain,
+                        time_in_domain,
+                        iwc_in_domain,
+                        height_in_domain,
+                        idx,
+                        OUTPUT_IMAGE_BASE_NAME
+                    )
+                else:
+                    print(f"    Avertissement: Pas de temps de survol valide pour le granule {idx}, la coupe verticale est ignorée.")
             else:
                 print(f"  4.0) Aucun point in-domain trouvé pour le granule {idx}. Les tracés spécifiques à ce granule sont ignorés.")
 
@@ -710,15 +881,19 @@ def main():
             print(f"AVERTISSEMENT: Impossible de traiter le fichier satellite '{os.path.basename(sat_filepath)}'. Erreur: {e}")
             continue
 
-    print("\nÉtape 5: Génération des cartes principales (globale et zoom)...")
-    if all_in_domain_data_list:
+    print("\nÉtape 5: Génération de la carte principale (globale et zoom)...")
+    if all_in_domain_data_list and MAIN_MAP_ENABLED:
         _plot_main_map(
-            all_satellite_lats_full, all_satellite_lons_full,
-            all_in_domain_data_list, all_matched_model_points_list,
-            model_lat2d_grid, model_lon2d_grid,
-            output_base_name=OUTPUT_IMAGE_BASE_NAME
+            all_satellite_lats_full,
+            all_satellite_lons_full,
+            all_in_domain_data_list,
+            all_matched_model_points_list,
+            model_lat2d_grid,
+            model_lon2d_grid,
+            OUTPUT_IMAGE_BASE_NAME
         )
-
+    elif MAIN_MAP_ENABLED is False: 
+        print ("L'option de génération de la figure principale a été désactivée")
     else:
         print("\n\nAucun point de satellite trouvé dans le domaine du modèle sur l'ensemble des fichiers.")
         print("Les graphiques principaux et polaires ne seront pas générés.")
