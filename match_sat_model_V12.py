@@ -282,15 +282,22 @@ def _read_satellite_h5(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, O
             fac = 1.0
             if SAT_FIELD_IWC_FACTOR in h5f.attrs:
                 fac = h5f.attrs[SAT_FIELD_IWC_FACTOR]
-                if isinstance(fac, np.ndarray): fac = fac.flatten()[0]
+                if isinstance(fac, np.ndarray):
+                    fac = fac.flatten()[0]
             if fac != 0:
                 iwc = iwc / fac
             iwc_missing = None
             if SAT_FIELD_IWC_MISSING in h5f.attrs:
                 iwc_missing = h5f.attrs[SAT_FIELD_IWC_MISSING]
-                if isinstance(iwc_missing, np.ndarray): iwc_missing = iwc_missing.flatten()[0]
+                if isinstance(iwc_missing, np.ndarray):
+                    iwc_missing = iwc_missing.flatten()[0]
             if iwc_missing is not None:
                 iwc = np.ma.masked_where(iwc == iwc_missing, iwc)
+            # Orientation : points x niveaux
+            n_pts = len(lat)
+            if iwc.ndim >= 2:
+                if iwc.shape[0] != n_pts and iwc.shape[1] == n_pts:
+                    iwc = iwc.T
             iwc_data = iwc
             print(f"    IWC satellite extrait. Forme: {iwc.shape}")
 
@@ -298,6 +305,10 @@ def _read_satellite_h5(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, O
         if SAT_FIELD_HEIGHT in h5f:
             raw_h = h5f[SAT_FIELD_HEIGHT][...]
             h = _unwrap_structured_array(raw_h).astype(np.float32)
+            n_pts = len(lat)
+            if h.ndim >= 2:
+                if h.shape[0] != n_pts and h.shape[1] == n_pts:
+                    h = h.T
             height_data = h
             print(f"    Hauteur satellite extraite. Forme: {h.shape}")
 
@@ -316,8 +327,22 @@ def _filter_in_domain(lat_sat, lon_sat, time_sat, lat2d, lon2d, iwc=None, height
     mask = d <= thr
     print(f"  4.1) {mask.sum()} points in-domain")
     yi, xi = np.unravel_index(idx[mask], lat2d.shape)
-    iwc_in = iwc[mask] if (iwc is not None and len(iwc)==len(mask)) else None
-    hgt_in = height[mask] if (height is not None and len(height)==len(mask)) else None
+
+    iwc_in = None
+    if iwc is not None:
+        arr = iwc
+        if arr.shape[0] != len(mask) and arr.ndim > 1 and arr.shape[1] == len(mask):
+            arr = arr.T
+        if arr.shape[0] == len(mask):
+            iwc_in = arr[mask]
+
+    hgt_in = None
+    if height is not None:
+        arr = height
+        if arr.shape[0] != len(mask) and arr.ndim > 1 and arr.shape[1] == len(mask):
+            arr = arr.T
+        if arr.shape[0] == len(mask):
+            hgt_in = arr[mask]
     return lat_sat[mask], lon_sat[mask], time_sat[mask], (yi,xi), mask, iwc_in, hgt_in
 
 def _plot_main_map(
@@ -568,8 +593,15 @@ def _plot_satellite_curtain(
     """
     print(f"  → Tracé rideau satellite (granule {granule_idx})...")
     n_pts, n_levels = iwc_sat_in.shape
+    if n_pts != len(lat_sat_in) and n_levels == len(lat_sat_in):
+        iwc_sat_in = iwc_sat_in.T
+        n_pts, n_levels = iwc_sat_in.shape
+
+    if height_sat_in.shape[0] != n_pts and height_sat_in.shape[1] == n_pts:
+        height_sat_in = height_sat_in.T
+
     data = iwc_sat_in.T
-    alt = height_sat_in[0,:] / 1000.0
+    alt = height_sat_in[0, :] / 1000.0
     order = np.argsort(alt)
     alt = alt[order]; data = data[order,:]
     x = np.arange(n_pts)
